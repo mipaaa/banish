@@ -1,0 +1,6 @@
+# Banned-IP review: /usr/local/bin/ban-review.sh daily (expiry ladder +
+# quietness; see ban-review.sh and ban-ip.sh). Companion cron to
+# /etc/cron.d/flood-detector; knobs overridable via env lines here.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+12 6 * * * root /usr/local/bin/ban-review.sh >/dev/null 2>&1

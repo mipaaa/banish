@@ -1,0 +1,18 @@
+# Alert log of /usr/local/bin/flood-detector.sh (canonical:
+# root/usr/local/bin/flood-detector.sh in the banish repo).
+#
+# Output is alert-only (a few lines per event, cooldown-limited), so the
+# file grows by kilobytes per year in normal operation; rotation is cheap
+# hygiene that bounds the multi-year worst case (sustained multi-IP
+# attacks) and keeps the alert history compressed on disk.
+#
+# No postrotate needed: the detector is a short-lived cron process that
+# re-opens the log with >> on every run, so rename+create is safe.
+/var/log/flood-detector.log {
+    weekly
+    rotate 8
+    missingok
+    notifempty
+    compress
+    delaycompress
+}

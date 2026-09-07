@@ -1,0 +1,13 @@
+# Action log of /usr/local/bin/ban-review.sh (canonical:
+# root/usr/local/bin/ban-review.sh in the banish repo). One summary
+# line per daily run plus one per release/heal; the review is a
+# short-lived cron process that re-opens the log with >>, so rename+create
+# is safe (no postrotate needed).
+/var/log/ban-review.log {
+    weekly
+    rotate 8
+    missingok
+    notifempty
+    compress
+    delaycompress
+}

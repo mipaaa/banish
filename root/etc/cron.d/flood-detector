@@ -1,0 +1,8 @@
+# Attack detector: /usr/local/bin/flood-detector.sh every 5 minutes.
+# Thresholds, log path, mail target and server tag are documented and
+# overridable via env lines here (see the script header). Alert mail uses
+# the SMTP_* values from the env file (ENV_FILE) via msmtp -- no separate
+# mail credentials to maintain.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+*/5 * * * * root /usr/local/bin/flood-detector.sh >/dev/null 2>&1
