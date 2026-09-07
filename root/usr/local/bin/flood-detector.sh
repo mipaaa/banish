@@ -10,8 +10,8 @@
 # The nginx side of the defense lives in the site nginx vhost
 # (its limit_req zones + the SQLi 444 rule; see README, Site contract).
 #
-# Three signals, from the site vhost access log
-# (/var/log/nginx/access-timed.log; static locations do not log there):
+# Three signals, from the site vhost access log (LOG=, default
+# /var/log/nginx/access.log; see the Site contract in README):
 #   FLOOD       one IP sustaining more than FLOOD_RPS requests/second,
 #               measured as the delta between consecutive runs (a true
 #               rate, NOT a share of recent traffic -- a lone polite
@@ -45,19 +45,22 @@
 # (Ubuntu 26.04 translates that into nftables automatically.)
 # ---------------------------------------------------------------------------
 
-LOG=${LOG:-/var/log/nginx/access-timed.log}
+ENV_FILE=${ENV_FILE:-/etc/banish/env}
+# envval KEY -- first value of KEY=... from the env file
+envval() {
+    sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | head -n 1
+}
+# Access log to watch: env var, else a LOG= line in the env file, else
+# the nginx default.
+LOG=${LOG:-$(envval LOG)}
+LOG=${LOG:-/var/log/nginx/access.log}
 OUT=${OUT:-/var/log/flood-detector.log}
 STATE=${STATE:-/var/lib/flood-detector.state}
-ENV_FILE=${ENV_FILE:-/etc/banish/env}
 WINDOW=${WINDOW:-3000}
 FLOOD_RPS=${FLOOD_RPS:-10}
 SQLI_THRESHOLD=${SQLI_THRESHOLD:-3}
 RATELIMIT_THRESHOLD=${RATELIMIT_THRESHOLD:-100}
 COOLDOWN=${COOLDOWN:-3600}
-# envval KEY -- first value of KEY=... from the env file
-envval() {
-    sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | head -n 1
-}
 # Alert recipient: env var, else a MAIL_TO= line in the env file, else a
 # placeholder that delivers nowhere -- set one of the first two.
 MAIL_TO=${MAIL_TO:-$(envval MAIL_TO)}

@@ -67,7 +67,8 @@ banish only reads what the site produces. A site needs:
 
 - an nginx access log whose first field is the client IP and whose
   status codes sit in the usual quoted position (any combined-format
-  log); default LOG=/var/log/nginx/access-timed.log
+  log). LOG: env var, a LOG= line in the env file, or the default
+  /var/log/nginx/access.log
 - the defensive rules themselves, in its own vhost: a SQLi drop rule
   (return 444) and limit_req zones producing 429 (414 is nginx
   built-in). banish never adds nginx config
@@ -78,6 +79,33 @@ banish only reads what the site produces. A site needs:
   env lines in the cron files
 - MAIL_TO (env var, a MAIL_TO= line in the env file, or the placeholder
   default alerts@example.com that delivers nowhere)
+
+Sketch of the rules the detector keys on -- the zone lives in http {},
+the application in the vhost:
+
+    # http {} -- one shared-memory counter bucket per client IP
+    limit_req_zone $binary_remote_addr zone=site_perip:10m rate=15r/s;
+
+    # vhost
+    server {
+        # Combined format is enough: client IP first, status right
+        # after the quoted request -- that is what the greps expect.
+        access_log /var/log/nginx/site-access.log combined;
+
+        # SQLi scanner noise: dropped without a response (444). Tune the
+        # token set to your threat picture; this one blunted a real
+        # sqlmap-style probe flood.
+        if ($request_uri ~* "(union.*select|information_schema|benchmark\(|sleep\(|waitfor.*delay|extractvalue\(|order(%20|\+|%2B|\s)*by)") {
+            return 444;
+        }
+
+        location / {
+            limit_req zone=site_perip burst=30 nodelay;
+            limit_req_status 429;   # not 503: 429 says "nginx throttled
+                                    # this client" -- the RATE-LIMIT signal
+            # ... proxy or serve your site ...
+        }
+    }
 
 ## Install
 
