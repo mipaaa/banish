@@ -173,3 +173,7 @@ iptables rule even with STATE/RCLOCAL redirected.
 Edit, commit, push, then re-run the bootstrap snippet (or install.sh
 from a checkout) on every box; cron and logrotate pick the changes up
 on their next run. Use --check to audit drift during incident reviews.
+
+## License
+
+MIT; see LICENSE.
