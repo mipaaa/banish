@@ -5,8 +5,11 @@
 # Usage (as root, from a checkout or the GitHub tarball):
 #   sudo ./install.sh            install/update scripts + cron + logrotate
 #   sudo ./install.sh --check    verify installed files match this checkout
-#   sudo ./install.sh legacy     legacy variant (postfix mail, manual
-#                                bans; installs only flood-detector.sh)
+#   sudo ./install.sh legacy     legacy variant (postfix mail, simple
+#                                ban-ip; installs flood-detector.sh and
+#                                ban-ip.sh; cron stays hand-managed)
+#   sudo ./install.sh legacy --check
+#                                 drift audit for a legacy box
 #
 # Idempotent: re-run on every update. Runtime state (/var/lib/bans.state,
 # /var/lib/flood-detector.state, the logs) is never touched. cron and
@@ -31,23 +34,20 @@ mode=${1:-install}
 case "$mode" in
     install|--check|legacy) ;;
     *)
-        echo "usage: $0 [--check | legacy]" >&2
+        echo "usage: $0 [--check | legacy [--check]]" >&2
         exit 1
         ;;
 esac
 
-if [ "$mode" = "legacy" ]; then
-    install -m 755 "$ROOT/legacy/flood-detector-postfix.sh" \
-        /usr/local/bin/flood-detector.sh
-    echo "installed: /usr/local/bin/flood-detector.sh (legacy variant)"
-    echo "note: /etc/cron.d/flood-detector on that box is managed by hand"
-    exit 0
+check=0
+if [ "$mode" = "--check" ] || [ "${2:-}" = "--check" ]; then
+    check=1
+    [ "$mode" = "--check" ] && mode=install
 fi
 
-check=0
-[ "$mode" = "--check" ] && check=1
 fail=0
 
+# do_file SRC DST PERM -- install, or compare when auditing drift
 do_file() {
     src="$1"; dst="$2"; perm="$3"
     if [ "$check" = "1" ]; then
@@ -62,6 +62,22 @@ do_file() {
         echo "installed: $dst"
     fi
 }
+
+if [ "$mode" = "legacy" ]; then
+    do_file "$ROOT/legacy/flood-detector-postfix.sh" \
+        /usr/local/bin/flood-detector.sh 755
+    do_file "$ROOT/legacy/ban-ip.sh" /usr/local/bin/ban-ip.sh 755
+    if [ "$check" = "1" ]; then
+        if [ "$fail" -eq 0 ]; then
+            echo "all files match this checkout"
+        fi
+        exit "$fail"
+    fi
+    echo "note: /etc/cron.d/flood-detector on that box is managed by hand"
+    echo "note: box settings (LOG, MAIL_TO, MAIL_FROM) are read from"
+    echo "      /etc/banish/env -- create it if it does not exist yet"
+    exit 0
+fi
 
 for f in flood-detector.sh ban-ip.sh ban-review.sh; do
     do_file "$SRC/usr/local/bin/$f" "/usr/local/bin/$f" 755

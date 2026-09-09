@@ -29,11 +29,17 @@
 # /etc/banish/env) -- typically a symlink to the site's existing mailer
 # env, so no separate credentials to maintain.
 # One alert per IP+reason per hour (COOLDOWN) keeps the mailbox sane.
+# The mail embeds the alerting IP's footprint from the analysis slice
+# (top requests, claimed user agents, statuses, raw tail) -- captured at
+# alert time, because daily log rotation races the alert: once rotation
+# wins, the live-log grep hints in the mail point at an emptied log and
+# the evidence is gone before a human reads it.
 #
 # Manual test (writes to /tmp, sends one test-flagged e-mail):
 #   TESTMODE=1 FLOOD_RPS=1 OUT=/tmp/fd.log STATE=/tmp/fd.state \
-#     /usr/local/bin/flood-detector.sh
-# (two runs ~a minute apart; the second sees the delta and alerts)
+#     RECENT=/tmp/fd.recent /usr/local/bin/flood-detector.sh
+# (two runs ~a minute apart; the second sees the delta and alerts; point
+# MSMTP_BIN at a stub script to capture the mail without msmtp)
 #
 # A confirmed hostile IP is banned by hand -- carrier NAT can put many
 # real customers behind one address, so first bans are never automatic.
@@ -56,6 +62,8 @@ LOG=${LOG:-$(envval LOG)}
 LOG=${LOG:-/var/log/nginx/access.log}
 OUT=${OUT:-/var/log/flood-detector.log}
 STATE=${STATE:-/var/lib/flood-detector.state}
+# Analysis-slice temp file; override to run isolated tests in parallel
+RECENT=${RECENT:-/tmp/flood-detector.recent}
 WINDOW=${WINDOW:-3000}
 FLOOD_RPS=${FLOOD_RPS:-10}
 SQLI_THRESHOLD=${SQLI_THRESHOLD:-3}
@@ -67,6 +75,8 @@ MAIL_TO=${MAIL_TO:-$(envval MAIL_TO)}
 MAIL_TO=${MAIL_TO:-alerts@example.com}
 SERVER_TAG=${SERVER_TAG:-$(hostname -s 2>/dev/null || hostname)}
 TESTMODE=${TESTMODE:-0}
+# Mail transport binary; override with a stub to capture mails in tests
+MSMTP_BIN=${MSMTP_BIN:-msmtp}
 
 # Probation auto-re-ban: "hist" records in BANS_STATE are released bans;
 # an alerting IP found there is re-banned via BAN_CMD (AUTO_REBAN=0 to
@@ -88,12 +98,38 @@ touch "$STATE" "$OUT" 2>/dev/null || exit 1
 now=$(date +%s)
 stamp=$(date "+%Y-%m-%d %H:%M:%S")
 
+# evidence IP -- the alerting IP's footprint in this run's analysis slice:
+# top request lines, claimed user agents, response statuses, raw tail.
+# Embedded in the alert mail because daily log rotation races the alert;
+# the slice file still exists at alert time, so this is the one copy of
+# the evidence that rotation can never take away.
+evidence() {
+    eip=$1
+    if [ ! -r "$RECENT" ]; then
+        echo "  (analysis slice unavailable)"
+        return
+    fi
+    eall=$(grep "^$eip " "$RECENT" 2>/dev/null)
+    if [ -z "$eall" ]; then
+        echo "  (no slice lines captured for this IP)"
+        return
+    fi
+    echo "  top requests:"
+    printf "%s\n" "$eall" | awk -F'"' '{print $2}' | sort | uniq -c | sort -rn | head -n 3 | sed "s/^/    /"
+    echo "  claimed user agents:"
+    printf "%s\n" "$eall" | awk -F'"' '{print $6}' | sort | uniq -c | sort -rn | head -n 3 | sed "s/^/    /"
+    echo "  response statuses:"
+    printf "%s\n" "$eall" | awk '{print $9}' | sort | uniq -c | sort -rn | sed "s/^/    /"
+    echo "  last raw log lines:"
+    printf "%s\n" "$eall" | tail -n 3 | sed "s/^/    /"
+}
+
 # send_mail KIND DETAIL IP -- build a one-shot msmtp config from the SMTP_*
 # values in the env file and mail the alert. Degrades to a log line when msmtp
 # is missing or mail is unconfigured; never breaks detection.
 send_mail() {
-    if ! command -v msmtp >/dev/null 2>&1; then
-        echo "$stamp mail: skipped (msmtp not installed)" >> "$OUT"
+    if ! command -v "$MSMTP_BIN" >/dev/null 2>&1; then
+        echo "$stamp mail: skipped ($MSMTP_BIN not found)" >> "$OUT"
         return
     fi
     smtp_host=$(envval SMTP_HOST)
@@ -139,6 +175,7 @@ send_mail() {
 
     subj="[${SERVER_TAG}] ALERT $1 ip=$3"
     [ "$TESTMODE" = "1" ] && subj="$subj (forced test)"
+    ev=$(evidence "$3")
     body="Attack detector on ${SERVER_TAG}
 
 Time:      $stamp
@@ -148,7 +185,11 @@ Source IP: $3
 
 Log:  $OUT
 
-Inspect (recent requests / claimed user agents):
+Evidence (captured at alert time from this run's analysis slice; log
+rotation cannot erase it):
+$ev
+
+Dig deeper in the live log (may already have rotated):
   grep \"^$3 \" $LOG | tail -5
   grep \"^$3 \" $LOG | awk -F'\"' '{print \$6}' | sort | uniq -c | sort -rn | head -3
 
@@ -159,7 +200,7 @@ Ban and persist across reboots:
 "
     if printf "To: %s\nFrom: %s\nSubject: %s\nDate: %s\n\n%s" \
             "$MAIL_TO" "$smtp_from" "$subj" "$(date -R)" "$body" \
-            | msmtp -C "$cfg" "$MAIL_TO" 2>>"$OUT"; then
+            | "$MSMTP_BIN" -C "$cfg" "$MAIL_TO" 2>>"$OUT"; then
         echo "$stamp mail: sent to $MAIL_TO" >> "$OUT"
     else
         echo "$stamp mail: msmtp FAILED (see msmtp output above)" >> "$OUT"
@@ -217,15 +258,15 @@ total=$(wc -l < "$LOG")
 
 elapsed=""
 slice=""
-: > /tmp/flood-detector.recent
+: > "$RECENT"
 
 if [ -n "$prev_run" ] && [ -n "$prev_lines" ]; then
     if [ "$total" -lt "$prev_lines" ]; then
-        tail -n "$WINDOW" "$LOG" > /tmp/flood-detector.recent
+        tail -n "$WINDOW" "$LOG" > "$RECENT"
         slice="post-rotation"
     elif [ "$total" -gt "$prev_lines" ]; then
         new_lines=$((total - prev_lines))
-        tail -n "$new_lines" "$LOG" > /tmp/flood-detector.recent
+        tail -n "$new_lines" "$LOG" > "$RECENT"
         slice="delta:$new_lines"
         elapsed=$((now - prev_run))
     fi
@@ -241,7 +282,7 @@ fi
 
 # 1) FLOOD: sustained per-IP rate over the delta window
 if [ -n "$elapsed" ]; then
-    set -- $(cut -d" " -f 1 /tmp/flood-detector.recent | sort | uniq -c | sort -rn | head -n 1)
+    set -- $(cut -d" " -f 1 "$RECENT" | sort | uniq -c | sort -rn | head -n 1)
     if [ -n "$1" ] && [ "$1" -ge "$((FLOOD_RPS * elapsed))" ]; then
         rps=$(($1 / elapsed))
         alert "$2" FLOOD "$1 requests in ${elapsed}s (~${rps} r/s sustained, threshold ${FLOOD_RPS}/s)"
@@ -249,14 +290,14 @@ if [ -n "$elapsed" ]; then
 fi
 
 # 2) SQLI-PROBE: URIs dropped by the SQLi 444 rule, or oversized (414)
-set -- $(grep -cE '" (444|414) ' /tmp/flood-detector.recent | head -n 1)
+set -- $(grep -cE '" (444|414) ' "$RECENT" | head -n 1)
 if [ -n "$1" ] && [ "$1" -ge "$SQLI_THRESHOLD" ]; then
-    set -- $(grep -E '" (444|414) ' /tmp/flood-detector.recent | cut -d" " -f 1 | sort | uniq -c | sort -rn | head -n 1)
+    set -- $(grep -E '" (444|414) ' "$RECENT" | cut -d" " -f 1 | sort | uniq -c | sort -rn | head -n 1)
     [ -n "$2" ] && alert "$2" SQLI-PROBE "$1 dropped or oversized URIs ($slice)"
 fi
 
 # 3) RATE-LIMIT: one IP piling up 429s shed by our limit_req zones
-set -- $(grep -F '" 429 ' /tmp/flood-detector.recent | cut -d" " -f 1 | sort | uniq -c | sort -rn | head -n 1)
+set -- $(grep -F '" 429 ' "$RECENT" | cut -d" " -f 1 | sort | uniq -c | sort -rn | head -n 1)
 if [ -n "$1" ] && [ "$1" -gt "$RATELIMIT_THRESHOLD" ]; then
     alert "$2" RATE-LIMIT "$1 throttled requests ($slice)"
 fi
@@ -266,4 +307,4 @@ tail -n 200 "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
 echo "meta:lastrun $now" >> "$STATE"
 echo "meta:lastlines $total" >> "$STATE"
 
-rm -f /tmp/flood-detector.recent
+rm -f "$RECENT"

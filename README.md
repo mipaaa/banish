@@ -21,8 +21,13 @@ from its original app repo; the nginx side stays with each site.
       etc/logrotate.d/flood-detector.logrotate
       etc/logrotate.d/ban-review.logrotate
     legacy/flood-detector-postfix.sh       older port for the original
-                                           server (postfix mail, manual
-                                           bans only)
+                                           server: postfix mail, box
+                                           settings (LOG, MAIL_TO,
+                                           MAIL_FROM) from the same
+                                           ENV_FILE path as the mainline
+    legacy/ban-ip.sh                       its simple ban companion
+                                           (iptables + /etc/rc.local
+                                           mirror; no ladder, no review)
     install.sh                             installer (--check, legacy)
 
 ## Detection signals (flood-detector.sh, every 5 minutes)
@@ -35,9 +40,12 @@ from its original app repo; the nginx side stays with each site.
 - RATE-LIMIT: one IP collecting many 429s shed by the site limit_req zones
 
 Each alert lands in /var/log/flood-detector.log and in an e-mail (msmtp),
-at most one per IP+reason per COOLDOWN (1 h). First bans are made by a
-human (carrier NAT can hide real customers behind one address); only
-probationers that re-offend are re-banned automatically.
+at most one per IP+reason per COOLDOWN (1 h). The mail embeds the
+alerting IP's footprint (top requests, claimed user agents, statuses,
+raw tail) captured from the run's analysis slice, so the evidence
+survives the daily log rotation that can race the alert. First bans are
+made by a human (carrier NAT can hide real customers behind one
+address); only probationers that re-offend are re-banned automatically.
 
 ## Ban lifecycle (ban-ip.sh + ban-review.sh)
 
@@ -120,21 +128,27 @@ From GitHub (bootstrap; pin a tag for reprovisioning):
 
 Drift audit (installed files vs this checkout):
 
-    sudo ./install.sh --check
+    sudo ./install.sh --check          # mainline boxes
+    sudo ./install.sh legacy --check   # legacy box
 
-Legacy variant (postfix mail, manual bans):
+Legacy variant (postfix mail, simple ban-ip; cron and the env file stay
+hand-managed on that box):
 
     sudo ./install.sh legacy
+
+Box settings for the legacy variant live in /etc/banish/env (LOG,
+MAIL_TO, MAIL_FROM); postfix handles the relay, so no SMTP_* keys are
+needed there.
 
 Install is idempotent and never touches runtime state
 (/var/lib/bans.state, /var/lib/flood-detector.state, the logs).
 
 ## Knobs (environment; full list in the script headers)
 
-    flood-detector.sh  LOG OUT STATE ENV_FILE WINDOW FLOOD_RPS(10)
+    flood-detector.sh  LOG OUT STATE RECENT ENV_FILE WINDOW FLOOD_RPS(10)
                        SQLI_THRESHOLD(3) RATELIMIT_THRESHOLD(100)
                        COOLDOWN(3600) MAIL_TO SERVER_TAG BANS_STATE
-                       AUTO_REBAN(1) BAN_CMD TESTMODE
+                       AUTO_REBAN(1) BAN_CMD MSMTP_BIN TESTMODE
     ban-ip.sh          STATE RCLOCAL BAN_T1(604800) BAN_T2(2592000)
     ban-review.sh      STATE RCLOCAL OUT ENV_FILE MAIL_TO SERVER_TAG
                        QUIET_SECS(259200) QUIET_PKTS(100) TESTMODE
@@ -146,7 +160,7 @@ mail settings (SMTP_*, MAIL_TO) usually live in the env file instead.
 
     # detector: two runs ~a minute apart; the second alerts + mails
     sudo TESTMODE=1 FLOOD_RPS=1 OUT=/tmp/fd.log STATE=/tmp/fd.state \
-      /usr/local/bin/flood-detector.sh
+      RECENT=/tmp/fd.recent /usr/local/bin/flood-detector.sh
 
     # ban ladder fast lane (see ban-review.sh header)
     STATE=/tmp/bans.state RCLOCAL=/tmp/rc.local /usr/local/bin/ban-ip.sh 192.0.2.1
