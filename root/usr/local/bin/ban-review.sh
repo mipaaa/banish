@@ -12,7 +12,10 @@
 # records, heals missing firewall rules, regenerates /etc/rc.local from
 # the state file, and mails a report (msmtp via the env file, like the
 # detector) only when something was released or healed.
-# External reputation checks (AbuseIPDB, Spamhaus DROP, RDAP) deliberately
+# Subnet bans (ban-ip.sh <ipv4>/nn keys) need no special handling:
+# counters, release, healing and rc.local regen all compare the CIDR
+# string exactly as iptables prints it.
+# External reputation checks (AbuseIPDB, Spamhaus, RDAP) deliberately
 # deferred; IPv4-only. Fast-lane test: ban with BAN_T1=0, then review with
 # QUIET_SECS=0.
 # ---------------------------------------------------------------------------
@@ -206,9 +209,9 @@ body="$body
 State file: $STATE
 Kept bans: $kept ($perm permanent)
 
-Manual unban of a still-listed IP:
+Manual unban of a still-listed IP (<ip> may be a CIDR subnet key):
   sudo iptables -D INPUT -s <ip> -j DROP
-  sudo sed -i '/^ban <ip> /d;/^ctr <ip> /d' $STATE
+  sudo sed -i '\|^ban <ip> |d;\|^ctr <ip> |d' $STATE
   sudo /usr/local/bin/ban-review.sh   # regenerates /etc/rc.local"
 
 smtp_host=$(envval SMTP_HOST)

@@ -43,14 +43,16 @@ Each alert lands in /var/log/flood-detector.log and in an e-mail (msmtp),
 at most one per IP+reason per COOLDOWN (1 h). The mail embeds the
 alerting IP's footprint (top requests, claimed user agents, statuses,
 raw tail) captured from the run's analysis slice, so the evidence
-survives the daily log rotation that can race the alert. First bans are
+survives the daily log rotation that can race the alert. The mail also
+carries copy-paste ban commands for the alerting IP and its whole /24
+subnet. First bans are
 made by a human (carrier NAT can hide real customers behind one
 address); only probationers that re-offend are re-banned automatically.
 
 ## Ban lifecycle (ban-ip.sh + ban-review.sh)
 
-- ban-ip.sh <ip> [--forever] [reason words...] -- iptables DROP now,
-  persistence via /etc/rc.local (regenerated from state; never
+- ban-ip.sh <ipv4[/prefix]> [--forever] [reason words...] -- iptables
+  DROP now, persistence via /etc/rc.local (regenerated from state; never
   hand-edit), recorded in /var/lib/bans.state with a ladder:
   strike 1 -> 7 days, strike 2 -> 30 days, strike 3+ (or --forever) ->
   permanent
@@ -62,11 +64,21 @@ address); only probationers that re-offend are re-banned automatically.
 - released IPs move to probation ("hist" records, kept forever); if the
   detector alerts on one again, ban-ip.sh re-bans it automatically with
   the next ladder strike (AUTO_REBAN)
+- subnet bans: ban-ip.sh also takes IPv4 CIDR (ban-ip.sh 185.177.72.0/24)
+  through the same ladder. The key is normalized to the network base
+  (host bits masked), so the state file, "iptables -L" output and
+  /etc/rc.local always agree. Two caveats: a broader rule shadows
+  single-IP bans beneath it (their DROP counters look flat, so review
+  may release those early -- harmless, the subnet rule still covers
+  them), and probation auto-reban matches keys exactly -- members of a
+  released subnet still alert but are never auto-re-banned; a human
+  re-bans the subnet
 
-Manual unban of a still-listed IP:
+Manual unban of a still-listed IP (works for CIDR subnet keys too; note
+the | sed delimiters -- a CIDR key contains a slash):
 
     sudo iptables -D INPUT -s <ip> -j DROP
-    sudo sed -i '/^ban <ip> /d;/^ctr <ip> /d' /var/lib/bans.state
+    sudo sed -i '\|^ban <ip> |d;\|^ctr <ip> |d' /var/lib/bans.state
     sudo /usr/local/bin/ban-review.sh   # regenerates /etc/rc.local
 
 ## Site contract

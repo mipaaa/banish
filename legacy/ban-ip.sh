@@ -1,7 +1,8 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# ban-ip.sh <ip> -- block an IP at the firewall NOW and persist the block
-# across reboots. Companion to flood-detector.sh: alert e-mails point here.
+# ban-ip.sh <ipv4[/prefix]> -- block an IP or whole subnet at the
+# firewall NOW and persist the block across reboots. Companion to
+# flood-detector.sh: alert e-mails point here.
 #
 # Canonical: this file (legacy/ban-ip.sh in the banish repo), installed as
 # /usr/local/bin/ban-ip.sh on the legacy server (postfix variant). The
@@ -15,17 +16,57 @@
 # inserts one idempotent rule line per IP, and when there is no rc.local
 # at all it creates the file with the loop. It then starts rc-local so
 # nothing waits for a reboot. Idempotent: re-banning an IP is a no-op.
+# A /nn prefix bans the whole subnet; host bits are masked to the
+# network base first so the key written into the loop equals the rule
+# iptables installs. IPv4-only.
 # ---------------------------------------------------------------------------
 set -eu
 
 ip="${1:-}"
+
+# target: bare IPv4, or IPv4 CIDR to ban a whole subnet. Split an
+# optional /prefix off first; it is validated and reattached after the
+# host bits are masked below.
+pfx=""
+had_pfx=0
+case "$ip" in
+    */*) had_pfx=1; pfx=${ip#*/}; ip=${ip%/*} ;;
+esac
+
 case "$ip" in
     ""|*[!0-9.]*)
-        echo "usage: $0 <ipv4>" >&2
+        echo "usage: $0 <ipv4[/prefix]>" >&2
         exit 1
         ;;
 esac
 [ "$(echo "$ip" | tr -cd '.' | wc -c)" -eq 3 ] || { echo "not an IPv4: $ip" >&2; exit 1; }
+
+# octets must be 0-255: host bits get masked below, and an out-of-range
+# octet would silently alias onto a different (valid!) network
+set -- $(echo "$ip" | tr . ' ')
+[ "$#" -eq 4 ] || { echo "not an IPv4: $ip" >&2; exit 1; }
+for o in "$@"; do
+    case "$o" in ''|*[!0-9]*) echo "not an IPv4: $ip" >&2; exit 1 ;; esac
+    [ "$o" -le 255 ] || { echo "not an IPv4: $ip" >&2; exit 1; }
+done
+
+if [ "$had_pfx" = "1" ]; then
+    case "$pfx" in
+        ''|*[!0-9]*) echo "bad prefix /$pfx (want /1../32) on subnet ban" >&2; exit 1 ;;
+    esac
+    if [ "$pfx" -lt 1 ] || [ "$pfx" -gt 32 ]; then
+        echo "bad prefix /$pfx (want /1../32; /0 would block everything)" >&2
+        exit 1
+    fi
+    if [ "$pfx" -ne 32 ]; then
+        # /32 is the bare address; anything else: mask host bits so the
+        # key persisted into rc.local equals the rule iptables installs
+        n=$(( ((($1 * 256 + $2) * 256 + $3) * 256 + $4) ))
+        m=$(( (4294967295 >> (32 - pfx)) << (32 - pfx) ))
+        n=$(( n & m ))
+        ip="$(( n / 16777216 )).$(( (n / 65536) % 256 )).$(( (n / 256) % 256 )).$(( n % 256 ))/$pfx"
+    fi
+fi
 
 if iptables -C INPUT -s "$ip" -j DROP >/dev/null 2>&1; then
     echo "already blocked: $ip"
@@ -36,16 +77,22 @@ fi
 
 RC=/etc/rc.local
 if [ -f "$RC" ] && grep -q "^for ip in " "$RC"; then
-    if grep -q " $ip " "$RC"; then
+    # the key may sit mid-loop (" ip ") or last (" ip;")
+    if grep -q " $ip " "$RC" || grep -q " $ip;" "$RC"; then
         echo "already persisted: $ip"
     else
-        sed -i "s/^for ip in /for ip in $ip /" "$RC"
+        # | delimiter: $ip may carry a /prefix
+        sed -i "s|^for ip in |for ip in $ip |" "$RC"
         echo "persisted in $RC: $ip"
     fi
 elif [ -f "$RC" ]; then
     # rc.local exists but has no ban loop: insert before the exit line
-    sed -i "\|^exit 0|i\\\tiptables -C INPUT -s $ip -j DROP 2>/dev/null || iptables -I INPUT 1 -s $ip -j DROP" "$RC"
-    echo "persisted in $RC (single rule): $ip"
+    if grep -q -- "-s $ip " "$RC"; then
+        echo "already persisted in $RC (single rule): $ip"
+    else
+        sed -i "\|^exit 0|i\\\tiptables -C INPUT -s $ip -j DROP 2>/dev/null || iptables -I INPUT 1 -s $ip -j DROP" "$RC"
+        echo "persisted in $RC (single rule): $ip"
+    fi
 else
     umask 022
     cat > "$RC" <<EORC

@@ -122,6 +122,9 @@ send_mail() {
     subj="[${SERVER_TAG}] ALERT $1 ip=$3"
     [ "$TESTMODE" = "1" ] && subj="$subj (forced test)"
     ev=$(evidence "$3")
+    # copy-pasteable subnet hint: the alerting IP's /24 (ban-ip.sh takes
+    # CIDR since the subnet feature)
+    s24=$(printf '%s' "$3" | awk -F. 'NF==4 {print $1"."$2"."$3".0/24"}')
     body="Attack detector on ${SERVER_TAG}
 
 Time:      $stamp
@@ -143,6 +146,8 @@ Ban until reboot only:
   sudo iptables -I INPUT 1 -s $3 -j DROP
 Ban and persist across reboots:
   sudo /usr/local/bin/ban-ip.sh $3
+Ban its whole /24 subnet (persists too):
+  sudo /usr/local/bin/ban-ip.sh $s24
 "
     if printf "To: %s\nFrom: %s\nSubject: %s\nDate: %s\n\n%s" \
             "$MAIL_TO" "$MAIL_FROM" "$subj" "$(date -R)" "$body" \

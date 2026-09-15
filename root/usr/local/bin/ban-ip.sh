@@ -1,8 +1,9 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# ban-ip.sh <ip> [--forever] [reason words...] -- block an IPv4 at the
-# firewall NOW, persist via /etc/rc.local, and record the ban for the
-# daily expiry review. Canonical: root/usr/local/bin/ban-ip.sh in the
+# ban-ip.sh <ipv4[/prefix]> [--forever] [reason words...] -- block an
+# IPv4 address or whole subnet at the firewall NOW, persist via
+# /etc/rc.local, and record the ban for the daily expiry review.
+# Canonical: root/usr/local/bin/ban-ip.sh in the
 # banish repo, installed by install.sh (legacy boxes may keep older
 # manual-only copies).
 # Full lifecycle docs: README.md, the "Ban lifecycle" section.
@@ -13,8 +14,11 @@
 # DROP counter roughly flat), see ban-review.sh. /var/lib/bans.state is
 # the source of truth ("ban <ip> <banned_at> <expires|perm> <strikes>
 # <reason>"); /etc/rc.local is REGENERATED from it -- never hand-edit it.
-# External reputation signals (AbuseIPDB, Spamhaus DROP, RDAP) deferred;
-# IPv4-only. Test: STATE=/tmp/bans.state RCLOCAL=/tmp/rc.local $0 192.0.2.1
+# External reputation signals (AbuseIPDB, Spamhaus, RDAP) deferred;
+# IPv4-only; a /nn prefix bans the whole subnet (host bits are masked
+# to the network base first, so the state key equals the rule iptables
+# installs -- a disagreement would make review drift). Test:
+# STATE=/tmp/bans.state RCLOCAL=/tmp/rc.local $0 192.0.2.1
 # (still inserts a REAL rule -- release with ban-review.sh or iptables -D).
 # ---------------------------------------------------------------------------
 set -eu
@@ -44,13 +48,49 @@ done
 reason="${reason# }"
 : "${reason:=manual}"
 
+# target: bare IPv4, or IPv4 CIDR to ban a whole subnet. Split an
+# optional /prefix off first; it is validated and reattached after the
+# host bits are masked below.
+pfx=""
+had_pfx=0
+case "$ip" in
+    */*) had_pfx=1; pfx=${ip#*/}; ip=${ip%/*} ;;
+esac
+
 case "$ip" in
     ""|*[!0-9.]*)
-        echo "usage: $0 <ipv4> [--forever] [reason words...]" >&2
+        echo "usage: $0 <ipv4[/prefix]> [--forever] [reason words...]" >&2
         exit 1
         ;;
 esac
 [ "$(echo "$ip" | tr -cd '.' | wc -c)" -eq 3 ] || { echo "not an IPv4: $ip" >&2; exit 1; }
+
+# octets must be 0-255: host bits get masked below, and an out-of-range
+# octet would silently alias onto a different (valid!) network
+set -- $(echo "$ip" | tr . ' ')
+[ "$#" -eq 4 ] || { echo "not an IPv4: $ip" >&2; exit 1; }
+for o in "$@"; do
+    case "$o" in ''|*[!0-9]*) echo "not an IPv4: $ip" >&2; exit 1 ;; esac
+    [ "$o" -le 255 ] || { echo "not an IPv4: $ip" >&2; exit 1; }
+done
+
+if [ "$had_pfx" = "1" ]; then
+    case "$pfx" in
+        ''|*[!0-9]*) echo "bad prefix /$pfx (want /1../32) on subnet ban" >&2; exit 1 ;;
+    esac
+    if [ "$pfx" -lt 1 ] || [ "$pfx" -gt 32 ]; then
+        echo "bad prefix /$pfx (want /1../32; /0 would block everything)" >&2
+        exit 1
+    fi
+    if [ "$pfx" -ne 32 ]; then
+        # /32 is the bare address; anything else: mask host bits so the
+        # state key equals the rule iptables actually installs
+        n=$(( ((($1 * 256 + $2) * 256 + $3) * 256 + $4) ))
+        m=$(( (4294967295 >> (32 - pfx)) << (32 - pfx) ))
+        n=$(( n & m ))
+        ip="$(( n / 16777216 )).$(( (n / 65536) % 256 )).$(( (n / 256) % 256 )).$(( n % 256 ))/$pfx"
+    fi
+fi
 
 now=$(date +%s)
 mkdir -p /var/lib
