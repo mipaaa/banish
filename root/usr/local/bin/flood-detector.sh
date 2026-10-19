@@ -7,6 +7,11 @@
 # and run every 5 minutes from /etc/cron.d/flood-detector (canonical copy:
 # root/etc/cron.d/flood-detector).
 #
+# The same env file also carries the box's detection tuning (LOG,
+# FLOOD_RPS, SQLI_THRESHOLD, RATELIMIT_THRESHOLD, COOLDOWN, WINDOW,
+# AUTO_REBAN): precedence is environment variable, then a KEY= line in
+# the env file, then the built-in default.
+#
 # The nginx side of the defense lives in the site nginx vhost
 # (its limit_req zones + the SQLi 444 rule; see README, Site contract).
 #
@@ -54,7 +59,7 @@
 ENV_FILE=${ENV_FILE:-/etc/banish/env}
 # envval KEY -- first value of KEY=... from the env file
 envval() {
-    sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | head -n 1
+    sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tr -d '\r' | head -n 1
 }
 # Access log to watch: env var, else a LOG= line in the env file, else
 # the nginx default.
@@ -64,10 +69,17 @@ OUT=${OUT:-/var/log/flood-detector.log}
 STATE=${STATE:-/var/lib/flood-detector.state}
 # Analysis-slice temp file; override to run isolated tests in parallel
 RECENT=${RECENT:-/tmp/flood-detector.recent}
+# Detection knobs: environment variable, else a KEY= line in the env
+# file, else the built-in default.
+WINDOW=${WINDOW:-$(envval WINDOW)}
 WINDOW=${WINDOW:-3000}
+FLOOD_RPS=${FLOOD_RPS:-$(envval FLOOD_RPS)}
 FLOOD_RPS=${FLOOD_RPS:-10}
+SQLI_THRESHOLD=${SQLI_THRESHOLD:-$(envval SQLI_THRESHOLD)}
 SQLI_THRESHOLD=${SQLI_THRESHOLD:-3}
+RATELIMIT_THRESHOLD=${RATELIMIT_THRESHOLD:-$(envval RATELIMIT_THRESHOLD)}
 RATELIMIT_THRESHOLD=${RATELIMIT_THRESHOLD:-100}
+COOLDOWN=${COOLDOWN:-$(envval COOLDOWN)}
 COOLDOWN=${COOLDOWN:-3600}
 # Alert recipient: env var, else a MAIL_TO= line in the env file, else a
 # placeholder that delivers nowhere -- set one of the first two.
@@ -82,6 +94,7 @@ MSMTP_BIN=${MSMTP_BIN:-msmtp}
 # an alerting IP found there is re-banned via BAN_CMD (AUTO_REBAN=0 to
 # disable, BAN_CMD=stub for dry runs).
 BANS_STATE=${BANS_STATE:-/var/lib/bans.state}
+AUTO_REBAN=${AUTO_REBAN:-$(envval AUTO_REBAN)}
 AUTO_REBAN=${AUTO_REBAN:-1}
 BAN_CMD=${BAN_CMD:-/usr/local/bin/ban-ip.sh}
 

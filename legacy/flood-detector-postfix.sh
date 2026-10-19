@@ -44,12 +44,13 @@
 # Box-specific settings come from an env file (ENV_FILE, default
 # /etc/banish/env) -- same model as the mainline variant, minus the
 # SMTP_* keys (the local postfix handles relay auth itself). Recognized
-# keys: LOG, MAIL_TO, MAIL_FROM. Precedence: environment variable, then
-# the env file, then the built-in generic default.
+# keys: LOG, MAIL_TO, MAIL_FROM, plus the detection knobs (FLOOD_RPS,
+# SQLI_THRESHOLD, RATELIMIT_THRESHOLD, COOLDOWN, WINDOW). Precedence:
+# environment variable, then the env file, then the built-in default.
 ENV_FILE=${ENV_FILE:-/etc/banish/env}
 # envval KEY -- first value of KEY=... from the env file
 envval() {
-    sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | head -n 1
+    sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tr -d '\r' | head -n 1
 }
 
 # Site access log to watch
@@ -59,10 +60,15 @@ OUT=${OUT:-/var/log/flood-detector.log}
 STATE=${STATE:-/var/lib/flood-detector.state}
 # Analysis-slice temp file; override to run isolated tests in parallel
 RECENT=${RECENT:-/tmp/flood-detector.recent}
+WINDOW=${WINDOW:-$(envval WINDOW)}
 WINDOW=${WINDOW:-3000}
+FLOOD_RPS=${FLOOD_RPS:-$(envval FLOOD_RPS)}
 FLOOD_RPS=${FLOOD_RPS:-10}
+SQLI_THRESHOLD=${SQLI_THRESHOLD:-$(envval SQLI_THRESHOLD)}
 SQLI_THRESHOLD=${SQLI_THRESHOLD:-3}
+RATELIMIT_THRESHOLD=${RATELIMIT_THRESHOLD:-$(envval RATELIMIT_THRESHOLD)}
 RATELIMIT_THRESHOLD=${RATELIMIT_THRESHOLD:-100}
+COOLDOWN=${COOLDOWN:-$(envval COOLDOWN)}
 COOLDOWN=${COOLDOWN:-3600}
 MAIL_TO=${MAIL_TO:-$(envval MAIL_TO)}
 MAIL_TO=${MAIL_TO:-root}   # local mailbox fallback

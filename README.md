@@ -96,7 +96,9 @@ banish only reads what the site produces. A site needs:
 - an env file with SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD,
   SMTP_TLS, SMTP_FROM; default ENV_FILE=/etc/banish/env -- typically a
   symlink to the site's existing mailer env (override per site), or plain
-  env lines in the cron files
+  env lines in the cron files. The detector's tuning knobs (FLOOD_RPS,
+  SQLI_THRESHOLD, RATELIMIT_THRESHOLD, COOLDOWN, WINDOW, AUTO_REBAN)
+  and LOG also read KEY= lines from this env file
 - MAIL_TO (env var, a MAIL_TO= line in the env file, or the placeholder
   default alerts@example.com that delivers nowhere)
 
@@ -165,8 +167,12 @@ Install is idempotent and never touches runtime state
     ban-review.sh      STATE RCLOCAL OUT ENV_FILE MAIL_TO SERVER_TAG
                        QUIET_SECS(259200) QUIET_PKTS(100) TESTMODE
 
-Set them via env lines in the cron files (canonical: root/etc/cron.d/);
-mail settings (SMTP_*, MAIL_TO) usually live in the env file instead.
+Set them via env lines in the cron files (canonical: root/etc/cron.d/)
+or KEY= lines in the env file (ENV_FILE, default /etc/banish/env); the
+detector's tuning knobs (FLOOD_RPS, SQLI_THRESHOLD, RATELIMIT_THRESHOLD,
+COOLDOWN, WINDOW, AUTO_REBAN) and LOG/MAIL_TO honor both. An environment
+variable beats the env file, which beats the built-in default. Mail
+settings (SMTP_*) live in the env file.
 
 ## Testing
 
