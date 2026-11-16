@@ -34,7 +34,14 @@ from its original app repo; the nginx side stays with each site.
 
 - FLOOD: one IP sustaining more than FLOOD_RPS requests/second,
   measured as the delta between consecutive runs (a true rate, not a
-  share of traffic -- a lone polite crawler never trips it)
+  share of traffic -- a lone polite crawler never trips it). An
+  offender whose requests are overwhelmingly scanner probe URLs
+  (wp-*, xmlrpc, dotfiles like .git/.env, phpmyadmin, ...;
+  PROBE_URL_REGEX, with >= PROBE_MIN matches and >= PROBE_RATIO of its
+  traffic) is banned automatically with NO mail (AUTO_BAN_PROBE): no
+  legit visitor, carrier NAT or not, pulls /wp-login.php at flood
+  rates. The ban uses the standard ladder; the AUTO-BAN log line plus
+  top probe URLs in /var/log/flood-detector.log is the audit trail
 - SQLI-PROBE: requests dropped by the site SQLi rule (status 444) or
   oversized URIs (414), beyond SQLI_THRESHOLD per run
 - RATE-LIMIT: one IP collecting many 429s shed by the site limit_req zones
@@ -47,7 +54,11 @@ survives the daily log rotation that can race the alert. The mail also
 carries copy-paste ban commands for the alerting IP and its whole /24
 subnet. First bans are
 made by a human (carrier NAT can hide real customers behind one
-address); only probationers that re-offend are re-banned automatically.
+address); the exceptions are probationers that re-offend (re-banned
+automatically) and probe-heavy flooders (see FLOOD above), where the
+URL pattern itself rules out a legit visitor. Other signals firing in
+the same run for an already auto-banned IP log with "mail suppressed"
+instead of mailing.
 
 ## Ban lifecycle (ban-ip.sh + ban-review.sh)
 
@@ -92,12 +103,18 @@ banish only reads what the site produces. A site needs:
 - the defensive rules themselves, in its own vhost: a SQLi drop rule
   (return 444) and limit_req zones producing 429 (414 is nginx
   built-in). banish never adds nginx config
+- logging of what it sheds: requests dropped with a logged status
+  (444/414/429) stay visible to the detector, URLs included -- that is
+  what feeds SQLI-PROBE, RATE-LIMIT and the probe-flood auto-ban.
+  Anything the site leaves unlogged (nginx access_log if= exclusions)
+  is invisible to every banish signal, by the site's choice
 - msmtp for alert mail (apt install msmtp)
 - an env file with SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD,
   SMTP_TLS, SMTP_FROM; default ENV_FILE=/etc/banish/env -- typically a
   symlink to the site's existing mailer env (override per site), or plain
   env lines in the cron files. The detector's tuning knobs (FLOOD_RPS,
-  SQLI_THRESHOLD, RATELIMIT_THRESHOLD, COOLDOWN, WINDOW, AUTO_REBAN)
+  SQLI_THRESHOLD, RATELIMIT_THRESHOLD, COOLDOWN, WINDOW, AUTO_REBAN,
+  AUTO_BAN_PROBE, PROBE_URL_REGEX, PROBE_MIN, PROBE_RATIO)
   and LOG also read KEY= lines from this env file
 - MAIL_TO (env var, a MAIL_TO= line in the env file, or the placeholder
   default alerts@example.com that delivers nowhere)
@@ -163,6 +180,8 @@ Install is idempotent and never touches runtime state
                        SQLI_THRESHOLD(3) RATELIMIT_THRESHOLD(100)
                        COOLDOWN(3600) MAIL_TO SERVER_TAG BANS_STATE
                        AUTO_REBAN(1) BAN_CMD MSMTP_BIN TESTMODE
+                       AUTO_BAN_PROBE(1) PROBE_URL_REGEX(default list in
+                       the script header) PROBE_MIN(5) PROBE_RATIO(0.8)
     ban-ip.sh          STATE RCLOCAL BAN_T1(604800) BAN_T2(2592000)
     ban-review.sh      STATE RCLOCAL OUT ENV_FILE MAIL_TO SERVER_TAG
                        QUIET_SECS(259200) QUIET_PKTS(100) TESTMODE
@@ -170,7 +189,8 @@ Install is idempotent and never touches runtime state
 Set them via env lines in the cron files (canonical: root/etc/cron.d/)
 or KEY= lines in the env file (ENV_FILE, default /etc/banish/env); the
 detector's tuning knobs (FLOOD_RPS, SQLI_THRESHOLD, RATELIMIT_THRESHOLD,
-COOLDOWN, WINDOW, AUTO_REBAN) and LOG/MAIL_TO honor both. An environment
+COOLDOWN, WINDOW, AUTO_REBAN, AUTO_BAN_PROBE, PROBE_URL_REGEX,
+PROBE_MIN, PROBE_RATIO) and LOG/MAIL_TO honor both. An environment
 variable beats the env file, which beats the built-in default. Mail
 settings (SMTP_*) live in the env file.
 
@@ -179,6 +199,9 @@ settings (SMTP_*) live in the env file.
     # detector: two runs ~a minute apart; the second alerts + mails
     sudo TESTMODE=1 FLOOD_RPS=1 OUT=/tmp/fd.log STATE=/tmp/fd.state \
       RECENT=/tmp/fd.recent /usr/local/bin/flood-detector.sh
+
+    # probe-flood auto-ban dry run: point BAN_CMD and MSMTP_BIN at stub
+    # scripts to capture the ban call and the mail without iptables/msmtp
 
     # ban ladder fast lane (see ban-review.sh header)
     STATE=/tmp/bans.state RCLOCAL=/tmp/rc.local /usr/local/bin/ban-ip.sh 192.0.2.1
