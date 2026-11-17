@@ -1,6 +1,6 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# Flood and SQLi-probe detector for an nginx access log.
+# Bot-classifying attack detector for an nginx access log.
 #
 # Installed by banish install.sh as /usr/local/bin/flood-detector.sh
 # (canonical copy: root/usr/local/bin/flood-detector.sh in the banish repo)
@@ -8,69 +8,69 @@
 # root/etc/cron.d/flood-detector).
 #
 # The same env file also carries the box's detection tuning (LOG,
-# FLOOD_RPS, SQLI_THRESHOLD, RATELIMIT_THRESHOLD, COOLDOWN, WINDOW,
-# AUTO_REBAN, AUTO_BAN_PROBE, PROBE_URL_REGEX, PROBE_MIN, PROBE_RATIO):
-# precedence is environment variable, then a KEY= line in the env file,
-# then the built-in default.
+# BADBOT_MIN, HEAVY_RPS, RATELIMIT_THRESHOLD, COOLDOWN, WINDOW, AUTO_REBAN,
+# AUTO_BAN, AUTO_BAN_DAYS, PROBE_URL_REGEX, DIGEST): precedence is
+# environment variable, then a KEY= line in the env file, then the
+# built-in default.
 #
 # The nginx side of the defense lives in the site nginx vhost
-# (its limit_req zones + the SQLi 444 rule; see README, Site contract).
+# (its limit_req zones + the 444 drop rules; see README, Site contract).
 #
-# Three signals, from the site vhost access log (LOG=, default
-# /var/log/nginx/access.log; see the Site contract in README):
-#   FLOOD       one IP sustaining more than FLOOD_RPS requests/second,
-#               measured as the delta between consecutive runs (a true
-#               rate, NOT a share of recent traffic -- a lone polite
-#               search crawler on a visitor-less site never trips it)
-#   SQLI-PROBE  requests dropped by the SQLi 444 rule (or 414: URI too
-#               long); a handful of stray probes is internet background
-#               radiation, so SQLI_THRESHOLD must be exceeded
-#   RATE-LIMIT  one IP collecting many 429s -- our own limit_req zones
-#               are actively shedding it (brute force or flood)
+# Visitor classes and what the detector does with them (humans and polite
+# bots never match a class and are never touched):
+#   bad bots     >= BADBOT_MIN probe hits in the analysis slice, at ANY
+#                speed. A probe hit is a request dropped by the site's
+#                444 scanner/SQLi rules (status 444), an oversized URI
+#                (414), or any request whose URL matches PROBE_URL_REGEX
+#                regardless of status. Auto-banned via ban-ip.sh
+#                (AUTO_BAN, default on) with NO mail: no legit visitor,
+#                NAT or not, pulls /wp-login.php or /.config/rclone.conf
+#                five times in five minutes
+#   heavy bots   one IP sustaining more than HEAVY_RPS requests/second,
+#                measured as the delta between consecutive runs (a true
+#                rate, NOT a share of recent traffic -- a lone polite
+#                crawler on a visitor-less site never trips it).
+#                Auto-banned the same way, no mail
+#   possible     one IP collecting many 429s (RATELIMIT_THRESHOLD) shed
+#   NAT / stuck  by the site's limit_req zones WITHOUT qualifying as a
+#   client       bad bot -- could be real people behind a carrier NAT or
+#                a broken client in a retry loop, so this is the one
+#                signal that still mails a human (AUTO_REBAN applies to
+#                probationers)
 #
-# Alerting: a line in /var/log/flood-detector.log plus an e-mail via msmtp.
-# Mail settings come from an env file (SMTP_HOST, SMTP_PORT, SMTP_USERNAME,
+# Auto-bans go through ban-ip.sh with --days AUTO_BAN_DAYS (strike-1
+# duration only; the ladder still escalates recidivists: 30 d, then
+# permanent). Every auto-ban (and every failed or disabled one that had
+# to fall back to mail) is appended as one line to the DIGEST file, which
+# ban-review.sh rolls into its daily report -- that report is the admin's
+# regular visibility into automatic bans. The AUTO-BAN log lines plus the
+# offender's top probe requests in /var/log/flood-detector.log are the
+# audit trail. If the ban command itself fails, the human alert mail is
+# sent instead (auto-ban impossible -> notify).
+#
+# Alerting (NAT/stuck-client path and failures): a line in
+# /var/log/flood-detector.log plus an e-mail via msmtp. Mail settings
+# come from an env file (SMTP_HOST, SMTP_PORT, SMTP_USERNAME,
 # SMTP_PASSWORD, SMTP_TLS, SMTP_FROM, and optionally the alert recipient
-# MAIL_TO) whose path is ENV_FILE (default
-# /etc/banish/env) -- typically a symlink to the site's existing mailer
-# env, so no separate credentials to maintain.
-# One alert per IP+reason per hour (COOLDOWN) keeps the mailbox sane.
-# The mail embeds the alerting IP's footprint from the analysis slice
-# (top requests, claimed user agents, statuses, raw tail) -- captured at
-# alert time, because daily log rotation races the alert: once rotation
-# wins, the live-log grep hints in the mail point at an emptied log and
-# the evidence is gone before a human reads it.
+# MAIL_TO) whose path is ENV_FILE (default /etc/banish/env) -- typically
+# a symlink to the site's existing mailer env, so no separate credentials
+# to maintain. One alert per IP+reason per hour (COOLDOWN) keeps the
+# mailbox sane. The mail embeds the alerting IP's footprint from the
+# analysis slice (top requests, claimed user agents, statuses, raw tail)
+# -- captured at alert time, because daily log rotation races the alert.
 #
 # Manual test (writes to /tmp, sends one test-flagged e-mail):
-#   TESTMODE=1 FLOOD_RPS=1 OUT=/tmp/fd.log STATE=/tmp/fd.state \
-#     RECENT=/tmp/fd.recent /usr/local/bin/flood-detector.sh
-# (two runs ~a minute apart; the second sees the delta and alerts; point
+#   TESTMODE=1 BADBOT_MIN=2 OUT=/tmp/fd.log STATE=/tmp/fd.state \
+#     RECENT=/tmp/fd.recent DIGEST=/tmp/fd.digest \
+#     /usr/local/bin/flood-detector.sh
+# (two runs ~a minute apart; the second sees the delta and acts; point
 # MSMTP_BIN at a stub script to capture the mail without msmtp, and
-# BAN_CMD at a stub to capture probe-flood auto-bans without iptables)
+# BAN_CMD at a stub to capture auto-bans without iptables)
 #
-# A confirmed hostile IP is banned by hand -- carrier NAT can put many
-# real customers behind one address, so first bans are never automatic.
-# The exceptions:
-#   - probation: an IP released from the ban-ip.sh expiry ladder (see
-#     ban-review.sh) that trips a real alert again is re-banned
-#     automatically (AUTO_REBAN, default on), advancing its ladder strike
-#     (7d -> 30d -> permanent)
-#   - probe flood (AUTO_BAN_PROBE, default on): a FLOOD offender whose
-#     requests are overwhelmingly scanner probe URLs (wp-*, xmlrpc,
-#     .git/.env-style dotfiles, phpmyadmin, ...; PROBE_URL_REGEX) is
-#     banned immediately WITHOUT an alert mail -- no legit visitor, NAT
-#     or not, pulls /wp-login.php at FLOOD_RPS. Qualifying: >= PROBE_MIN
-#     matching requests and >= PROBE_RATIO (default 0.8) of the IP's
-#     requests in the analysis slice. The ban goes through ban-ip.sh
-#     (standard ladder, reason "auto-probe-flood"); the AUTO-BAN log
-#     line plus its top probe requests replace the mail as the audit
-#     trail. If the ban command fails, the normal FLOOD mail is sent.
-#   iptables -I INPUT -s <ip> -j DROP
-# (Ubuntu 26.04 translates that into nftables automatically.)
-#
-# Site note: probes the site's nginx sheds with 444 stay in the access
+# Site note: probes the site sheds with a logged 444 stay in the access
 # log and are visible here; requests the site leaves unlogged (nginx
-# access_log if= exclusions) are invisible to every banish signal.
+# access_log if= exclusions -- on this site: the i_wanna_buy legacy
+# paths) are invisible to every banish signal, by the site's choice.
 # ---------------------------------------------------------------------------
 
 ENV_FILE=${ENV_FILE:-/etc/banish/env}
@@ -86,16 +86,21 @@ OUT=${OUT:-/var/log/flood-detector.log}
 STATE=${STATE:-/var/lib/flood-detector.state}
 # Analysis-slice temp file; override to run isolated tests in parallel
 RECENT=${RECENT:-/tmp/flood-detector.recent}
+# One line per detector auto-ban; ban-review.sh mails it daily
+DIGEST=${DIGEST:-$(envval DIGEST)}
+DIGEST=${DIGEST:-/var/lib/flood-digest}
 # Detection knobs: environment variable, else a KEY= line in the env
 # file, else the built-in default.
 WINDOW=${WINDOW:-$(envval WINDOW)}
 WINDOW=${WINDOW:-3000}
-FLOOD_RPS=${FLOOD_RPS:-$(envval FLOOD_RPS)}
-FLOOD_RPS=${FLOOD_RPS:-10}
-SQLI_THRESHOLD=${SQLI_THRESHOLD:-$(envval SQLI_THRESHOLD)}
-SQLI_THRESHOLD=${SQLI_THRESHOLD:-3}
+BADBOT_MIN=${BADBOT_MIN:-$(envval BADBOT_MIN)}
+BADBOT_MIN=${BADBOT_MIN:-5}
+case "$BADBOT_MIN" in ''|*[!0-9]*) BADBOT_MIN=5 ;; esac
+HEAVY_RPS=${HEAVY_RPS:-$(envval HEAVY_RPS)}
+HEAVY_RPS=${HEAVY_RPS:-15}
 RATELIMIT_THRESHOLD=${RATELIMIT_THRESHOLD:-$(envval RATELIMIT_THRESHOLD)}
 RATELIMIT_THRESHOLD=${RATELIMIT_THRESHOLD:-100}
+case "$RATELIMIT_THRESHOLD" in ''|*[!0-9]*) RATELIMIT_THRESHOLD=100 ;; esac
 COOLDOWN=${COOLDOWN:-$(envval COOLDOWN)}
 COOLDOWN=${COOLDOWN:-3600}
 # Alert recipient: env var, else a MAIL_TO= line in the env file, else a
@@ -115,21 +120,23 @@ AUTO_REBAN=${AUTO_REBAN:-$(envval AUTO_REBAN)}
 AUTO_REBAN=${AUTO_REBAN:-1}
 BAN_CMD=${BAN_CMD:-/usr/local/bin/ban-ip.sh}
 
-# Probe-flood auto-ban: a FLOOD offender whose requests overwhelmingly
-# match PROBE_URL_REGEX (common scanner paths) is banned via BAN_CMD with
-# no alert mail. >= PROBE_MIN matching requests and >= PROBE_RATIO of the
-# IP's slice requests must match, so a throttled legit client never
-# qualifies.
-AUTO_BAN_PROBE=${AUTO_BAN_PROBE:-$(envval AUTO_BAN_PROBE)}
-AUTO_BAN_PROBE=${AUTO_BAN_PROBE:-1}
-PROBE_MIN=${PROBE_MIN:-$(envval PROBE_MIN)}
-PROBE_MIN=${PROBE_MIN:-5}
-case "$PROBE_MIN" in ''|*[!0-9]*) PROBE_MIN=5 ;; esac
-PROBE_RATIO=${PROBE_RATIO:-$(envval PROBE_RATIO)}
-PROBE_RATIO=${PROBE_RATIO:-0.8}
-case "$PROBE_RATIO" in ''|*[!0-9.]*) PROBE_RATIO=0.8 ;; esac
-awk -v r="$PROBE_RATIO" 'BEGIN { exit !(r > 0 && r <= 1) }' || PROBE_RATIO=0.8
-PROBE_URL_DEFAULT='(^|/)wp-(login|admin|content|includes|config|json)|(^|/)xmlrpc|(^|/)\.(git|svn|hg|env|htaccess|htpasswd|ds_store|aws|ssh|idea)(/|\.|\?|$)|%2e(env|git)|(^|/)(phpmyadmin|adminer|cgi-bin|vendor/phpunit|eval-stdin)|(^|/)actuator(/|\?|$)'
+# Auto-ban master switch and strike-1 duration for auto-bans. AUTO_BAN=0
+# rolls back to human-alert behavior for every class without a redeploy.
+AUTO_BAN=${AUTO_BAN:-$(envval AUTO_BAN)}
+AUTO_BAN=${AUTO_BAN:-1}
+AUTO_BAN_DAYS=${AUTO_BAN_DAYS:-$(envval AUTO_BAN_DAYS)}
+AUTO_BAN_DAYS=${AUTO_BAN_DAYS:-1}
+case "$AUTO_BAN_DAYS" in ''|0|*[!0-9]*) AUTO_BAN_DAYS=1 ;; esac
+# per-run caps: a bad day must not wedge the 5-minute cron slot (state
+# lock serialization with ban-review.sh is the real constraint)
+MAX_AUTO_BAN=${MAX_AUTO_BAN:-10}
+MAX_ALERT=${MAX_ALERT:-5}
+
+# Scanner probe URLs (lowercase; paths are matched lowercased). Keep in
+# sync with the site's nginx $block_request scanner patterns -- nginx is
+# the cheap first drop (444 before limit_req), this list additionally
+# catches probe URLs that still slip through to a 404/429.
+PROBE_URL_DEFAULT='(^|/)wp-(login|admin|content|includes|config|json)|(^|/)xmlrpc|(^|/)\.(git|svn|hg|env|config|htaccess|htpasswd|ds_store|aws|ssh|idea)(/|\.|\?|$)|%2e(env|git)|(^|/)(phpmyadmin|adminer|cgi-bin|vendor/phpunit|eval-stdin)|(^|/)actuator(/|\?|$)'
 PROBE_URL_REGEX=${PROBE_URL_REGEX:-$(envval PROBE_URL_REGEX)}
 PROBE_URL_REGEX=${PROBE_URL_REGEX:-$PROBE_URL_DEFAULT}
 # a syntactically broken custom regex would silently kill the classifier
@@ -137,10 +144,10 @@ PROBE_URL_REGEX=${PROBE_URL_REGEX:-$PROBE_URL_DEFAULT}
 printf 'x\n' | grep -qE "$PROBE_URL_REGEX" >/dev/null 2>&1
 [ "$?" -eq 2 ] && PROBE_URL_REGEX=$PROBE_URL_DEFAULT
 
-# FLOOD_RPS is an integer (requests/second). Validate defensively: a bad
+# HEAVY_RPS is an integer (requests/second). Validate defensively: a bad
 # value would otherwise abort the script inside arithmetic expansion.
-case "$FLOOD_RPS" in
-    ''|*[!0-9]*) FLOOD_RPS=10 ;;
+case "$HEAVY_RPS" in
+    ''|*[!0-9]*) HEAVY_RPS=15 ;;
 esac
 
 mkdir -p /var/lib
@@ -149,8 +156,18 @@ touch "$STATE" "$OUT" 2>/dev/null || exit 1
 
 now=$(date +%s)
 stamp=$(date "+%Y-%m-%d %H:%M:%S")
-# the IP (if any) auto-banned in this run: further alerts for it log only
-silenced=""
+# IPs already acted on this run (auto-banned or mailed): later signals
+# skip them, so one IP never yields two mails or a mail after a ban
+handled=""
+is_handled() {
+    case " $handled " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# digest LINE -- one line into the file ban-review.sh reports daily
+digest() {
+    echo "$stamp $1" >> "$DIGEST" 2>/dev/null
+}
 
 # evidence IP -- the alerting IP's footprint in this run's analysis slice:
 # top request lines, claimed user agents, response statuses, raw tail.
@@ -246,6 +263,11 @@ Evidence (captured at alert time from this run's analysis slice; log
 rotation cannot erase it):
 $ev
 
+This mail is sent only for traffic the detector will NOT ban
+automatically: possible people behind a shared address, or a failed
+auto-ban. Scanner probes and floods are banned silently and appear in
+the daily ban-review digest instead.
+
 Dig deeper in the live log (may already have rotated):
   grep \"^$3 \" $LOG | tail -5
   grep \"^$3 \" $LOG | awk -F'\"' '{print \$6}' | sort | uniq -c | sort -rn | head -3
@@ -272,16 +294,10 @@ alert() {
     aip=$1
     akind=$2
     adetail=$3
-    # an IP auto-banned this run must not slip a mail through a second
-    # signal (e.g. its 444s counted as SQLI-PROBE): log only
-    if [ -n "$silenced" ] && [ "$aip" = "$silenced" ]; then
-        echo "$stamp ALERT $akind $adetail ip=$aip (mail suppressed: auto-banned this run)" >> "$OUT"
-        return
-    fi
     key="$akind:$aip"
     alast=$(grep -F "$key " "$STATE" 2>/dev/null | tail -n 1 | cut -d" " -f 2)
     if [ -n "$alast" ] && [ $((now - alast)) -lt "$COOLDOWN" ]; then
-        return
+        return 1
     fi
     echo "$key $now" >> "$STATE"
     # Probation auto-re-ban (see ban-review.sh); failures never break the alert
@@ -293,6 +309,7 @@ alert() {
             if "$BAN_CMD" "$aip" probation-realert "$akind" >>"$OUT" 2>&1; then
                 reban=" [auto-reban strike=$((pstrikes + 1))]"
                 echo "$stamp auto-reban PROBATION ip=$aip strike=$((pstrikes + 1)) after $akind" >> "$OUT"
+                digest "AUTO-REBAN probation ip=$aip after $akind"
             else
                 echo "$stamp auto-reban FAILED ip=$aip (ban-ip output above)" >> "$OUT"
             fi
@@ -300,29 +317,43 @@ alert() {
     fi
     echo "$stamp ALERT $akind $adetail ip=$aip$reban" >> "$OUT"
     send_mail "$akind" "$adetail$reban" "$aip"
+    return 0
 }
 
-# probe_ban IP TOTAL HITS RPS ELAPSED -- silently ban a flooding scanner:
-# no mail, standard ban-ip.sh ladder, reason "auto-probe-flood". The log
-# lines (ban result + top probe requests) are the audit trail. Non-zero
-# return (disabled, BAN_CMD missing, ban failed) makes the caller fall
-# back to the human alert.
-probe_ban() {
-    [ "$AUTO_BAN_PROBE" = "1" ] && [ -x "$BAN_CMD" ] || return 1
-    bip=$1
-    btop=$(grep "^$bip " "$RECENT" 2>/dev/null | awk -F'"' '{print $2}' \
-        | grep -iE "$PROBE_URL_REGEX" | sort | uniq -c | sort -rn | head -n 3)
-    if "$BAN_CMD" "$bip" auto-probe-flood >>"$OUT" 2>&1; then
-        silenced="$bip"
-        echo "$stamp AUTO-BAN PROBE-FLOOD ip=$bip $3/$2 requests match probe URLs (~$4 r/s over $5s, min $PROBE_MIN ratio $PROBE_RATIO); mail suppressed" >> "$OUT"
-        if [ -n "$btop" ]; then
-            echo "  top probe requests:" >> "$OUT"
-            printf "%s\n" "$btop" | sed "s/^/    /" >> "$OUT"
-        fi
-        return 0
-    fi
-    echo "$stamp auto-ban FAILED ip=$bip (ban-ip output above); alerting instead" >> "$OUT"
-    return 1
+# auto_ban IP CLASS DETAIL -- ban without mail. The AUTO-BAN log line
+# plus the offender's top probe requests are the audit trail; one digest
+# line feeds the daily ban-review report. Returns non-zero (and the
+# caller falls back to the human alert) only when the ban was attempted
+# and failed or auto-banning is disabled; an already-banned IP counts as
+# handled without any noise.
+auto_ban() {
+    abip=$1
+    abclass=$2
+    abdetail=$3
+    [ "$AUTO_BAN" = "1" ] && [ -x "$BAN_CMD" ] || return 1
+    about=$("$BAN_CMD" "$abip" --days "$AUTO_BAN_DAYS" "auto-$abclass" 2>&1)
+    case "$about" in
+        banned:*)
+            echo "$stamp AUTO-BAN $abclass ip=$abip $abdetail; ban-ip: $about; mail suppressed" >> "$OUT"
+            abtop=$(grep "^$abip " "$RECENT" 2>/dev/null | awk -F'"' '{print $2}' \
+                | grep -iE "$PROBE_URL_REGEX" | sort | uniq -c | sort -rn | head -n 3)
+            if [ -n "$abtop" ]; then
+                echo "  top probe requests:" >> "$OUT"
+                printf "%s\n" "$abtop" | sed "s/^/    /" >> "$OUT"
+            fi
+            digest "AUTO-BAN $abclass ip=$abip $abdetail"
+            return 0
+            ;;
+        already\ banned*)
+            echo "$stamp AUTO-BAN $abclass ip=$abip skipped (already banned)" >> "$OUT"
+            return 0
+            ;;
+        *)
+            echo "$stamp auto-ban FAILED ip=$abip (ban-ip output above); alerting instead" >> "$OUT"
+            digest "AUTO-BAN-FAILED $abclass ip=$abip"
+            return 1
+            ;;
+    esac
 }
 
 # --- pick the analysis slice ----------------------------------------------
@@ -335,10 +366,11 @@ probe_ban() {
 #
 #   baseline    first run ever: record state, analyze nothing
 #   idle        no new lines since the previous run: nothing to see
-#   delta:N     N new lines: SQLI/RATE-LIMIT analyze them; FLOOD also
-#               requires a sane elapsed window (120-900s) for the rate math
+#   delta:N     N new lines: classify them; the heavy-bot rate check
+#               additionally requires a sane elapsed window (120-900s)
 #   rotation    line count went backwards (log rotated): analyze the new
-#               file's tail, skip FLOOD (count vs elapsed is distorted)
+#               file's tail; heavy-bot rate math is skipped (elapsed
+#               unknown), probe-hit classification still applies
 
 prev_run=$(grep -F "meta:lastrun " "$STATE" 2>/dev/null | tail -n 1 | cut -d" " -f 2)
 prev_lines=$(grep -F "meta:lastlines " "$STATE" 2>/dev/null | tail -n 1 | cut -d" " -f 2)
@@ -361,55 +393,102 @@ if [ -n "$prev_run" ] && [ -n "$prev_lines" ]; then
 # else: baseline (first run) or idle (total == prev_lines): empty slice
 fi
 
-# FLOOD additionally needs a trustworthy elapsed window for rate division
+# heavy-bot rate division needs a trustworthy elapsed window
 if [ -n "$elapsed" ]; then
     if [ "$elapsed" -lt 120 ] || [ "$elapsed" -gt 900 ]; then
         elapsed=""
     fi
 fi
 
-# 1) FLOOD: sustained per-IP rate over the delta window. An offender
-#    whose traffic is overwhelmingly probe URLs is auto-banned without
-#    mail (probe_ban); everything else alerts a human as before.
-if [ -n "$elapsed" ]; then
-    set -- $(cut -d" " -f 1 "$RECENT" | sort | uniq -c | sort -rn | head -n 1)
-    if [ -n "$1" ] && [ "$1" -ge "$((FLOOD_RPS * elapsed))" ]; then
-        rps=$(($1 / elapsed))
-        fip=$2
-        ftot=$1
-        fhits=0
-        if [ "$AUTO_BAN_PROBE" = "1" ]; then
-            fhits=$(grep "^$fip " "$RECENT" 2>/dev/null | awk -F'"' '{print $2}' \
-                | awk '{print $2}' | grep -icE "$PROBE_URL_REGEX" 2>/dev/null)
-            fhits=${fhits:-0}
-        fi
-        if [ "$fhits" -ge "$PROBE_MIN" ] \
-            && awk -v h="$fhits" -v t="$ftot" -v r="$PROBE_RATIO" \
-                   'BEGIN { exit !(t > 0 && h >= r * t) }'; then
-            probe_ban "$fip" "$ftot" "$fhits" "$rps" "$elapsed" \
-                || alert "$fip" FLOOD "$ftot requests in ${elapsed}s (~${rps} r/s sustained, threshold ${FLOOD_RPS}/s)"
-        else
-            alert "$fip" FLOOD "$ftot requests in ${elapsed}s (~${rps} r/s sustained, threshold ${FLOOD_RPS}/s)"
-        fi
+# --- classify every IP in the slice ---------------------------------------
+#
+# One awk pass -> "ip total probe_hits r429" per client. Probe hits: the
+# site already dropped the request as scanner garbage (logged 444), the
+# URI was oversized (414), or the URL matches PROBE_URL_REGEX at any
+# status (probe paths that still slip through to a 404/429). The status
+# is taken from the word after the second quote, so request lines with
+# stray spaces cannot shift it. The regex travels via ENVIRON, not -v:
+# awk -v processes backslash escapes in values and would corrupt \. or
+# \? from the pattern into metacharacters.
+statsfile="$RECENT.stats"
+PROBE_RE="$PROBE_URL_REGEX" awk '
+    BEGIN { re = ENVIRON["PROBE_RE"] }
+    {
+        ip = $1
+        q = index($0, "\"")
+        if (q == 0) next
+        rest = substr($0, q + 1)
+        e = index(rest, "\"")
+        if (e == 0) next
+        req = substr(rest, 1, e - 1)
+        split(req, m, " ")
+        path = tolower(m[2])
+        split(substr(rest, e + 1), t, " ")
+        st = t[1]
+        tot[ip]++
+        if (st == 444 || st == 414 || path ~ re) hits[ip]++
+        if (st == 429) r429[ip]++
+    }
+    END { for (ip in tot) printf "%s %d %d %d\n", ip, tot[ip], hits[ip] + 0, r429[ip] + 0 }
+' "$RECENT" > "$statsfile"
+
+nban=0
+nalert=0
+
+# 1) bad bots: probe hits at ANY speed -- auto-ban, no mail. A slow
+#    scanner rotating IPs is exactly this shape (it never reaches the
+#    heavy-bot rate).
+while read -r sip stot shits sr429; do
+    [ -n "$sip" ] || continue
+    is_handled "$sip" && continue
+    [ "$shits" -ge "$BADBOT_MIN" ] || continue
+    [ "$nban" -ge "$MAX_AUTO_BAN" ] && break
+    if auto_ban "$sip" bad-bot "$shits/$stot requests match scanner probe patterns ($slice)"; then
+        :
+    else
+        alert "$sip" BAD-BOT "auto-ban failed or disabled; $shits probe hits in $stot requests ($slice)" \
+            || true
     fi
+    handled="$handled $sip"
+    nban=$((nban + 1))
+done < "$statsfile"
+
+# 2) heavy bots: sustained per-IP rate over the delta window
+if [ -n "$elapsed" ]; then
+    while read -r sip stot shits sr429; do
+        [ -n "$sip" ] || continue
+        is_handled "$sip" && continue
+        [ "$stot" -ge "$((HEAVY_RPS * elapsed))" ] || continue
+        [ "$nban" -ge "$MAX_AUTO_BAN" ] && break
+        srps=$((stot / elapsed))
+        if auto_ban "$sip" heavy-bot "$stot requests in ${elapsed}s (~${srps} r/s sustained, threshold ${HEAVY_RPS}/s)"; then
+            :
+        else
+            alert "$sip" HEAVY-BOT "auto-ban failed or disabled; $stot requests in ${elapsed}s (~${srps} r/s sustained, threshold ${HEAVY_RPS}/s)" \
+                || true
+        fi
+        handled="$handled $sip"
+        nban=$((nban + 1))
+    done < "$statsfile"
 fi
 
-# 2) SQLI-PROBE: URIs dropped by the SQLi 444 rule, or oversized (414)
-set -- $(grep -cE '" (444|414) ' "$RECENT" | head -n 1)
-if [ -n "$1" ] && [ "$1" -ge "$SQLI_THRESHOLD" ]; then
-    set -- $(grep -E '" (444|414) ' "$RECENT" | cut -d" " -f 1 | sort | uniq -c | sort -rn | head -n 1)
-    [ -n "$2" ] && alert "$2" SQLI-PROBE "$1 dropped or oversized URIs ($slice)"
-fi
-
-# 3) RATE-LIMIT: one IP piling up 429s shed by our limit_req zones
-set -- $(grep -F '" 429 ' "$RECENT" | cut -d" " -f 1 | sort | uniq -c | sort -rn | head -n 1)
-if [ -n "$1" ] && [ "$1" -gt "$RATELIMIT_THRESHOLD" ]; then
-    alert "$2" RATE-LIMIT "$1 throttled requests ($slice)"
-fi
+# 3) possible NAT / stuck client: piling up 429s on ordinary URLs. The
+#    one signal that still mails a human -- automatic bans are impossible
+#    here without risking real people behind a shared address.
+while read -r sip stot shits sr429; do
+    [ -n "$sip" ] || continue
+    is_handled "$sip" && continue
+    [ "$sr429" -gt "$RATELIMIT_THRESHOLD" ] || continue
+    [ "$nalert" -ge "$MAX_ALERT" ] && break
+    if alert "$sip" RATE-LIMIT "$sr429 throttled requests of $stot total ($slice)"; then
+        handled="$handled $sip"
+        nalert=$((nalert + 1))
+    fi
+done < "$statsfile"
 
 # keep the state file small, then record this run's bookkeeping
 tail -n 200 "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
 echo "meta:lastrun $now" >> "$STATE"
 echo "meta:lastlines $total" >> "$STATE"
 
-rm -f "$RECENT"
+rm -f "$RECENT" "$statsfile"

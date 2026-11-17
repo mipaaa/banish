@@ -1,7 +1,7 @@
 #!/bin/sh
 # ---------------------------------------------------------------------------
-# ban-ip.sh <ipv4[/prefix]> [--forever] [reason words...] -- block an
-# IPv4 address or whole subnet at the firewall NOW, persist via
+# ban-ip.sh <ipv4[/prefix]> [--forever] [--days N] [reason words...] --
+# block an IPv4 address or whole subnet at the firewall NOW, persist via
 # /etc/rc.local, and record the ban for the daily expiry review.
 # Canonical: root/usr/local/bin/ban-ip.sh in the
 # banish repo, installed by install.sh (legacy boxes may keep older
@@ -9,7 +9,11 @@
 # Full lifecycle docs: README.md, the "Ban lifecycle" section.
 #
 # Ladder (enforced by ban-review.sh): strike 1 -> 7 days, strike 2 -> 30
-# days, strike 3+ or --forever -> permanent. Strikes climb from "hist"
+# days, strike 3+ or --forever -> permanent. --days N overrides the
+# strike-1 duration only (the detector's auto-bans pass --days 1: their
+# IPs are mostly single-use, so a short first ban keeps the firewall and
+# state small, while genuine recidivists still climb the full ladder).
+# Strikes climb from "hist"
 # probation records; release additionally requires quietness (iptables
 # DROP counter roughly flat), see ban-review.sh. /var/lib/bans.state is
 # the source of truth ("ban <ip> <banned_at> <expires|perm> <strikes>
@@ -32,19 +36,28 @@ case "$BAN_T2" in ''|*[!0-9]*) BAN_T2=2592000 ;; esac
 
 ip=""
 forever=0
+days=""
 reason=""
-for arg in "$@"; do
-    case "$arg" in
-        --forever) forever=1 ;;
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --forever) forever=1; shift ;;
+        --days)
+            [ "$#" -ge 2 ] || { echo "usage: $0 <ipv4[/prefix]> [--forever] [--days N] [reason words...]" >&2; exit 1; }
+            days=$2; shift 2 ;;
         *)
             if [ -z "$ip" ]; then
-                ip="$arg"
+                ip="$1"
             else
-                reason="$reason $arg"
+                reason="$reason $1"
             fi
-            ;;
+            shift ;;
     esac
 done
+if [ -n "$days" ]; then
+    case "$days" in
+        0|*[!0-9]*) echo "bad --days value: $days (want a positive integer)" >&2; exit 1 ;;
+    esac
+fi
 reason="${reason# }"
 : "${reason:=manual}"
 
@@ -59,7 +72,7 @@ esac
 
 case "$ip" in
     ""|*[!0-9.]*)
-        echo "usage: $0 <ipv4[/prefix]> [--forever] [reason words...]" >&2
+        echo "usage: $0 <ipv4[/prefix]> [--forever] [--days N] [reason words...]" >&2
         exit 1
         ;;
 esac
@@ -128,6 +141,8 @@ if [ "$forever" = "1" ] || [ "$strikes" -ge 3 ]; then
     expires="perm"
 elif [ "$strikes" -eq 2 ]; then
     expires=$((now + BAN_T2))
+elif [ -n "$days" ]; then
+    expires=$((now + days * 86400))
 else
     expires=$((now + BAN_T1))
 fi

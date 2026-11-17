@@ -5,13 +5,17 @@
 # ban-ip.sh and flood-detector.sh; full lifecycle docs: README.md, the
 # "Ban lifecycle" section.
 #
-# Per "ban <ip> <banned_at> <expires|perm> <strikes>" in /var/lib/bans.state:
+# Per "ban <ip> <banned_at> <expires|perm> <strikes" in /var/lib/bans.state:
 # releases expired non-permanent bans that were also QUIET for QUIET_SECS
 # (default 3d; iptables DROP-counter growth under QUIET_PKTS/day, default
 # 100; a reboot restarts the quiet clock), moves them to "hist" probation
 # records, heals missing firewall rules, regenerates /etc/rc.local from
 # the state file, and mails a report (msmtp via the env file, like the
-# detector) only when something was released or healed.
+# detector) when something was released or healed -- or when the
+# detector appended auto-ban lines to the DIGEST file since the last
+# review (that section is the admin's daily visibility into silent
+# automatic bans; it is cleared once mailed, and kept for retry if
+# msmtp fails).
 # Subnet bans (ban-ip.sh <ipv4>/nn keys) need no special handling:
 # counters, release, healing and rc.local regen all compare the CIDR
 # string exactly as iptables prints it.
@@ -35,6 +39,15 @@ MAIL_TO=${MAIL_TO:-$(envval MAIL_TO)}
 MAIL_TO=${MAIL_TO:-alerts@example.com}
 SERVER_TAG=${SERVER_TAG:-$(hostname -s 2>/dev/null || hostname)}
 TESTMODE=${TESTMODE:-0}
+# Auto-ban digest written by flood-detector.sh; same DIGEST key as there
+# (env var, a DIGEST= line in the env file, or the default path)
+DIGEST=${DIGEST:-$(envval DIGEST)}
+DIGEST=${DIGEST:-/var/lib/flood-digest}
+# digest_clear -- drop the digest once it is surely reported (mail sent,
+# or mail impossible on this box); kept for retry when msmtp fails
+digest_clear() {
+    : > "$DIGEST" 2>/dev/null || true
+}
 QUIET_SECS=${QUIET_SECS:-259200}   # 3 days of counter flatness to release
 QUIET_PKTS=${QUIET_PKTS:-100}      # tolerated packets per day while "quiet"
 case "$QUIET_SECS" in ''|*[!0-9]*) QUIET_SECS=259200 ;; esac
@@ -172,7 +185,7 @@ if [ "$RCLOCAL" = "/etc/rc.local" ]; then
     systemctl start rc-local >/dev/null 2>&1 || true
 fi
 
-# --- summary: always a log line, e-mail only when something was done -----
+# --- summary: always a log line, e-mail when something was done --------
 rel_count=0
 for r in $released; do
     rel_count=$((rel_count + 1))
@@ -181,16 +194,33 @@ heal_count=0
 for h in $healed; do
     heal_count=$((heal_count + 1))
 done
-echo "$stamp summary: kept=$kept perm=$perm released=$rel_count healed=$heal_count" \
+# snapshot the detector's auto-ban digest (bounded: a mail outage must
+# not grow it without limit)
+digest_n=0
+digest_body=""
+if [ -s "$DIGEST" ]; then
+    digest_body=$(tail -n 500 "$DIGEST")
+    digest_n=$(printf '%s\n' "$digest_body" | wc -l)
+    digest_n=${digest_n%%[!0-9]*}
+    case "$digest_n" in ''|*[!0-9]*) digest_n=0 ;; esac
+fi
+echo "$stamp summary: kept=$kept perm=$perm released=$rel_count healed=$heal_count digest=$digest_n" \
     ${held_expired:+"held-expired-noisy:$held_expired"} >> "$OUT"
 
-if [ "$rel_count" -eq 0 ] && [ "$heal_count" -eq 0 ]; then
+if [ "$rel_count" -eq 0 ] && [ "$heal_count" -eq 0 ] && [ "$digest_n" -eq 0 ]; then
     exit 0
 fi
 
 body="Banned-IP review on ${SERVER_TAG}
 Time: $stamp
-
+"
+if [ "$digest_n" -gt 0 ]; then
+    body="$body
+Detector auto-bans since the last review ($digest_n):
+$digest_body
+"
+fi
+body="$body
 Released (moved to probation; a new detector alert re-bans them with a
 longer ladder step):"
 for r in $released; do
@@ -217,10 +247,12 @@ Manual unban of a still-listed IP (<ip> may be a CIDR subnet key):
 smtp_host=$(envval SMTP_HOST)
 if [ -z "$smtp_host" ] || [ "$smtp_host" = "CHANGE_ME" ]; then
     echo "$stamp mail: skipped (no SMTP_HOST in $ENV_FILE)" >> "$OUT"
+    digest_clear
     exit 0
 fi
 if ! command -v msmtp >/dev/null 2>&1; then
     echo "$stamp mail: skipped (msmtp not installed)" >> "$OUT"
+    digest_clear
     exit 0
 fi
 smtp_port=$(envval SMTP_PORT)
@@ -259,7 +291,7 @@ chmod 600 "$cfg"
     fi
 } > "$cfg"
 
-subj="[${SERVER_TAG}] BAN-REVIEW released=$rel_count healed=$heal_count"
+subj="[${SERVER_TAG}] BAN-REVIEW released=$rel_count healed=$heal_count autobans=$digest_n"
 if [ "$TESTMODE" = "1" ]; then
     subj="$subj (forced test)"
 fi
@@ -267,7 +299,8 @@ if printf "To: %s\nFrom: %s\nSubject: %s\nDate: %s\n\n%s" \
         "$MAIL_TO" "$smtp_from" "$subj" "$(date -R)" "$body" \
         | msmtp -C "$cfg" "$MAIL_TO" 2>>"$OUT"; then
     echo "$stamp mail: sent to $MAIL_TO" >> "$OUT"
+    digest_clear
 else
-    echo "$stamp mail: msmtp FAILED (see msmtp output above)" >> "$OUT"
+    echo "$stamp mail: msmtp FAILED (see msmtp output above; digest kept for retry)" >> "$OUT"
 fi
 rm -f "$cfg"
